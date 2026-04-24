@@ -53,6 +53,9 @@ def match_pending_candidates(
 
     Used when the verifier files a finding without `supersedes_candidate_ids`
     so the controller can still mark the originating candidate(s) resolved.
+    Ambiguous cases (e.g. endpoint-only hits) are deliberately NOT matched
+    here — those candidates stay pending and the verifier must resolve them
+    explicitly on the next substep.
     """
     filed_ep = _canonical_endpoint(filed.endpoint)
     if not filed_ep or not filed.title:
@@ -123,6 +126,22 @@ class FindingWriter:
             ep = entry["endpoint"] or "N/A"
             lines.append(f"{i}. [{sev}] {entry['title']} — {ep}")
         return "**Findings filed so far:**\n" + "\n".join(lines)
+
+    def summary_for_worker(self) -> str:
+        """Worker-facing roster: title + endpoint only, no severity.
+
+        Severity and verifier reasoning are intentionally omitted — workers
+        might argue with the verifier's judgement rather than do new work.
+        Returns an empty string when nothing has been filed so the caller
+        can suppress the whole block.
+        """
+        if not self._index:
+            return ""
+        lines = []
+        for entry in self._index:
+            ep = entry["endpoint"] or "N/A"
+            lines.append(f"- {entry['title']} — {ep}")
+        return "Findings filed so far — do not re-file:\n" + "\n".join(lines)
 
     def write(self, filed: FindingFiled) -> str:
         os.makedirs(self.findings_dir, exist_ok=True)

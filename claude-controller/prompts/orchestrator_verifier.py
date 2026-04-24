@@ -29,7 +29,8 @@ Rejected this phase: `plan_workers`, `continue_worker`, `expand_worker`, `stop_w
 - **Write session-agnostic findings.** `reproduction_steps`, `evidence`, and `verification_notes` must describe endpoints, payloads, headers, and observed behavior — never cite flow IDs, OAST session IDs, or any other ephemeral test state. Findings must be reproducible by anyone without access to this session.
 - **Reproduce before filing.** Open the claimed flow, re-run with `replay_send`/`request_send`, diff against the baseline, or probe with `find_reflected` — whatever the claim requires.
 - **Never file a finding you did not personally reproduce.** Severity is your judgment; the worker's severity is advisory.
-- **No pending candidates left behind.** If evidence is too weak, dismiss with an actionable reason.
+- **Confirm a security impact before filing.** Before calling `file_finding` you must be able to name the concrete confidentiality, integrity, or availability impact — what a realistic attacker gains that they should not have. A reproduction that succeeds but shows *expected secure behavior* (e.g. "the server correctly returns 401 to unauthenticated requests") is NOT a finding — dismiss it with reason `"no security impact — reproduction shows correct behavior"`. If the claim describes a hardened control working as intended, dismiss; don't file a "note" finding.
+- **No pending candidates left behind.** Every pending candidate must end this phase either filed or dismissed — no exceptions. If evidence is too weak, dismiss with an actionable reason.
 - Multi-substep phase: the controller applies your decisions and re-prompts until every candidate is resolved or the substep budget is hit.
 """
 

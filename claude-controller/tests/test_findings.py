@@ -4,7 +4,12 @@ import os
 import tempfile
 import unittest
 
-from findings import FindingWriter, _canonical_endpoint, match_pending_candidates, slugify
+from findings import (
+    FindingWriter,
+    _canonical_endpoint,
+    match_pending_candidates,
+    slugify,
+)
 from tools import FindingCandidate, FindingFiled
 
 
@@ -113,6 +118,30 @@ class TestMatchPendingCandidates(unittest.TestCase):
         filed = _make("Reflected XSS", endpoint="")
         pending = [_candidate("c001", "Reflected XSS", "GET /search")]
         self.assertEqual(match_pending_candidates(filed, pending), [])
+
+
+class TestFindingWriterSummaryForWorker(unittest.TestCase):
+    """B2: summary_for_worker lists title+endpoint only, no severity."""
+
+    def test_empty_returns_empty_string(self):
+        with tempfile.TemporaryDirectory() as td:
+            w = FindingWriter(td)
+            self.assertEqual(w.summary_for_worker(), "")
+
+    def test_populated_lists_title_and_endpoint_no_severity(self):
+        with tempfile.TemporaryDirectory() as td:
+            w = FindingWriter(td)
+            w.write(_make("XSS in search", endpoint="GET /search", severity="high"))
+            w.write(_make("SQLi in login", endpoint="POST /login", severity="critical"))
+            out = w.summary_for_worker()
+            self.assertIn("Findings filed so far — do not re-file:", out)
+            self.assertIn("XSS in search — /search", out)
+            self.assertIn("SQLi in login — /login", out)
+            # Severity must NOT appear — workers might argue with verifier.
+            self.assertNotIn("[high]", out)
+            self.assertNotIn("[critical]", out)
+            self.assertNotIn("critical", out)
+            self.assertNotIn("high", out)
 
 
 if __name__ == "__main__":

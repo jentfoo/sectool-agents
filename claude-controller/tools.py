@@ -151,11 +151,25 @@ class CandidatePool:
         with self._lock:
             return [self._by_id[i] for i in self._order if self._by_id[i].status == "pending"]
 
-    def mark(self, candidate_id: str, status: str) -> None:
+    def mark(self, candidate_id: str, status: str) -> bool:
+        """Transition a candidate to `verified` or `dismissed`.
+
+        Returns True when the candidate moved, False when the call was a
+        no-op (unknown id, terminal state already set, or invalid status).
+        Only `pending → verified` and `pending → dismissed` are accepted;
+        terminal states are sticky so a late `dismiss_candidate` can't
+        silently downgrade an already-verified candidate.
+        """
+        if status not in ("verified", "dismissed"):
+            return False
         with self._lock:
             c = self._by_id.get(candidate_id)
-            if c is not None:
-                c.status = status
+            if c is None:
+                return False
+            if c.status != "pending":
+                return False
+            c.status = status
+            return True
 
     def ids_since(self, counter_before: int) -> list[str]:
         """IDs minted after `counter_before`."""
@@ -230,6 +244,113 @@ class CandidateDismissal:
 PHASE_IDLE = "idle"
 PHASE_VERIFICATION = "verification"
 PHASE_DIRECTION = "direction"
+
+
+def _parse_plan_args(args: dict[str, Any]) -> tuple[
+    list["PlanEntry"] | None, list[str], str | None,
+]:
+    """Validate a `plan_workers` args payload.
+
+    Returns `(entries, rejections, error_text)`. When `error_text` is not
+    None the whole payload should be rejected with that text. Otherwise
+    `entries` holds the parsed entries and `rejections` is a (possibly
+    empty) list of per-entry skip reasons to surface to the caller.
+    """
+    raw = args.get("plans", None)
+    if raw is None or not isinstance(raw, list):
+        got = type(raw).__name__ if raw is not None else "missing"
+        return None, [], (
+            f"Rejected: cannot parse arguments ('plans' {got}). "
+            "Expected JSON shape "
+            "{\"plans\":[{\"worker_id\":N,\"assignment\":\"...\"}]}."
+        )
+    if len(raw) == 0:
+        return None, [], (
+            "Rejected: 'plans' array is empty. Provide at least one "
+            "{worker_id, assignment} object."
+        )
+    entries: list[PlanEntry] = []
+    rejections: list[str] = []
+    for i, p in enumerate(raw):
+        if not isinstance(p, dict):
+            rejections.append(f"plans[{i}]: entry must be an object")
+            continue
+        if "worker_id" not in p:
+            rejections.append(f"plans[{i}]: worker_id is required")
+            continue
+        try:
+            wid = int(p["worker_id"])
+        except (TypeError, ValueError):
+            rejections.append(
+                f"plans[{i}]: worker_id must be an integer (got {p['worker_id']!r})"
+            )
+            continue
+        if wid < 1:
+            rejections.append(f"plans[{i}]: worker_id must be >= 1 (got {wid})")
+            continue
+        if "assignment" not in p:
+            rejections.append(
+                f"plans[{i}] (worker_id={wid}): assignment is required"
+            )
+            continue
+        try:
+            asg = str(p["assignment"]).strip()
+        except (TypeError, ValueError):
+            rejections.append(
+                f"plans[{i}] (worker_id={wid}): assignment must be a string"
+            )
+            continue
+        if not asg:
+            rejections.append(
+                f"plans[{i}] (worker_id={wid}): assignment is empty"
+            )
+            continue
+        entries.append(PlanEntry(worker_id=wid, assignment=asg))
+    if not entries:
+        reason = "; ".join(rejections) if rejections else "no entries parseable"
+        return None, rejections, f"Rejected: no valid plan entries. {reason}"
+    return entries, rejections, None
+
+
+def coalesce_decisions(
+    worker_decisions: list["WorkerDecision"],
+    plan: list["PlanEntry"] | None,
+) -> list["WorkerDecision"]:
+    """Collapse duplicate per-worker decisions before the controller applies them.
+
+    The director often calls `continue_worker` / `expand_worker` / `stop_worker`
+    for the same worker across substeps; each hit queues a duplicate instruction
+    into the worker's SDK client. Semantics:
+
+    - Pure last-writer-wins per `worker_id` — if the director's last decision
+      for a worker is `stop`, the worker stops; if `continue`, the worker
+      continues.
+    - A `plan` entry covers the worker via the spawn/retarget path, so drop
+      any `continue`/`expand` for `plan`'d workers. A `stop` for a `plan`'d
+      worker is an explicit override and is preserved.
+
+    The relative order of the first-seen decision per `worker_id` is kept
+    so downstream iteration is deterministic.
+    """
+    plan_ids: set[int] = set()
+    if plan is not None:
+        plan_ids = {p.worker_id for p in plan}
+
+    # Last-writer-wins per worker_id; record first-seen order for stable output.
+    order: list[int] = []
+    last: dict[int, "WorkerDecision"] = {}
+    for d in worker_decisions:
+        if d.worker_id not in last:
+            order.append(d.worker_id)
+        last[d.worker_id] = d
+
+    out: list["WorkerDecision"] = []
+    for wid in order:
+        d = last[wid]
+        if wid in plan_ids and d.kind != "stop":
+            continue
+        out.append(d)
+    return out
 
 
 class DecisionQueue:
@@ -532,27 +653,10 @@ def build_orch_mcp_server(decisions: DecisionQueue) -> Any:
     async def plan_workers(args: dict[str, Any]) -> dict[str, Any]:
         if decisions.current_phase != PHASE_DIRECTION:
             return _reject_wrong_phase(PHASE_DIRECTION, decisions.current_phase, "plan_workers")
-        raw = args.get("plans") or []
-        if not isinstance(raw, list) or not raw:
+        entries, rejections, err = _parse_plan_args(args)
+        if err is not None:
             return {
-                "content": [{"type": "text", "text": "Rejected: plans must be a non-empty array."}],
-                "is_error": True,
-            }
-        entries: list[PlanEntry] = []
-        for p in raw:
-            if not isinstance(p, dict):
-                continue
-            try:
-                wid = int(p["worker_id"])
-                asg = str(p["assignment"]).strip()
-            except (KeyError, TypeError, ValueError):
-                continue
-            if wid < 1 or not asg:
-                continue
-            entries.append(PlanEntry(worker_id=wid, assignment=asg))
-        if not entries:
-            return {
-                "content": [{"type": "text", "text": "Rejected: no valid plan entries."}],
+                "content": [{"type": "text", "text": err}],
                 "is_error": True,
             }
         decisions.set_plan(entries)
@@ -560,16 +664,14 @@ def build_orch_mcp_server(decisions: DecisionQueue) -> Any:
         # this phase (set_plan merges by worker_id).
         total = len(decisions.plan) if decisions.plan is not None else 0
         ids_this_call = ", ".join(str(e.worker_id) for e in entries)
-        return {
-            "content": [{
-                "type": "text",
-                "text": (
-                    f"Plan recorded: this call added/updated worker_ids "
-                    f"[{ids_this_call}]; current plan covers {total} worker(s) "
-                    f"total this phase."
-                ),
-            }],
-        }
+        text = (
+            f"Plan recorded: this call added/updated worker_ids "
+            f"[{ids_this_call}]; current plan covers {total} worker(s) "
+            f"total this phase."
+        )
+        if rejections:
+            text += " Skipped: " + "; ".join(rejections)
+        return {"content": [{"type": "text", "text": text}]}
 
     def _record_worker_decision(kind: str, args: dict[str, Any]) -> dict[str, Any]:
         if decisions.current_phase != PHASE_DIRECTION:

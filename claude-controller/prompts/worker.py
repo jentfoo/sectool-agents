@@ -22,7 +22,8 @@ The orchestrator independently reproduces and files the formal finding; your job
 
 ## Loop semantics
 
-- You often get `"Continue your current testing plan."` with no new instruction. Take the next concrete step and keep going.
+- You often get `"Continue your current testing plan. Take the next concrete step."` with no new instruction. Take the next concrete step and keep going.
+- At iteration boundaries the continue directive may be prefixed with a short state block (e.g. a "Findings filed so far — do not re-file:" list). Treat the list as hard off-limits for re-reporting; then read the directive on the final line and carry out the next step.
 - **End every productive response with tool calls.** A response with no tool calls signals escalation.
 - If the assignment is genuinely exhausted, reply with one short text block and no tool calls.
 

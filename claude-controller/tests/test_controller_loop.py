@@ -340,9 +340,11 @@ class TestRunWorkerUntilEscalation(unittest.TestCase):
         self.assertEqual(len(runs), 3)
         self.assertEqual(w.escalation_reason, "budget")
         # First turn does not send a Continue query; subsequent ones do.
+        # Intra-iteration requeries use the bare continue directive (no
+        # findings roster — tokens precious between autonomous turns).
         self.assertEqual(client.queries, [
-            "Continue your current testing plan.",
-            "Continue your current testing plan.",
+            controller._BARE_WORKER_CONTINUE,
+            controller._BARE_WORKER_CONTINUE,
         ])
 
     def test_non_productive_turn_escalates_early(self):
@@ -974,17 +976,34 @@ class TestDirectionPhase(unittest.TestCase):
         self.assertEqual(len(client.queries), 1)
 
     def test_reaches_substep_cap(self):
+        """When the director keeps making fresh progress each substep but
+        never covers the alive worker, the main loop runs to the cap and
+        self-review fires afterward (because decisions were produced)."""
         decisions = DecisionQueue()
+        # Alive worker is id=1; the test queues stop decisions for other ids
+        # so the coverage check never fires and the main loop runs to the cap.
         w1 = self._make_worker(1)
 
-        # Script DIRECTION_MAX_SUBSTEPS + 1 turns: the cap-hitting main loop,
-        # plus the mandatory self-review substep that follows it.
-        empty_turn = [
-            AssistantMessage(content=[TextBlock(text="thinking")], model="test"),
-            _orch_result(0.001),
+        def make_action(i: int):
+            def act(d: DecisionQueue):
+                d.add_decision(WorkerDecision(
+                    kind="stop", worker_id=100 + i, reason="cleanup",
+                ))
+            return act
+
+        script = [
+            _orch_tool_turn("stop_worker",
+                            {"worker_id": 100 + i, "reason": "x"})
+            for i in range(1, controller.DIRECTION_MAX_SUBSTEPS + 1)
         ]
-        script = [list(empty_turn) for _ in range(controller.DIRECTION_MAX_SUBSTEPS + 1)]
-        client = FakeSDKClient(script)
+        script.append([
+            AssistantMessage(content=[TextBlock(text="self-review done")], model="test"),
+            _orch_result(0.001),
+        ])
+        actions = [make_action(i) for i in range(1, controller.DIRECTION_MAX_SUBSTEPS + 1)]
+        actions.append(None)
+
+        client = _OrchSideEffectClient(script, decisions, actions)
         _, cost = _run(controller.run_direction_phase(
             _FakeManaged(client), None, decisions, [w1], worker_runs={},
             verification_summary="ok", findings_summary="x",
@@ -1322,6 +1341,313 @@ class TestFindingLifecycle(unittest.TestCase):
         self.assertEqual(pool.get(c1).status, "verified")
         self.assertEqual(pool.get(c2).status, "verified")
         self.assertEqual(pool.pending(), [])
+
+
+class TestVerifyDedup(unittest.TestCase):
+    """A1, A3: per-substep dedup of dismissals and findings."""
+
+    def test_dismiss_dedup_logs_once_per_id(self):
+        """Repeated `dismiss_candidate` calls for one id must only log once."""
+        pool = CandidatePool()
+        cid = pool.add(title="A", severity="low", endpoint="/x",
+                       flow_ids=["aaaa11"], summary="", evidence_notes="",
+                       reproduction_hint="")
+        decisions = DecisionQueue()
+
+        # Verifier dismisses the same id twice in one burst, then finishes.
+        def action(d: DecisionQueue):
+            d.add_dismissal(cid, "dup 1")
+            d.add_dismissal(cid, "dup 2")
+            d.set_verification_done("ok")
+
+        client = _OrchSideEffectClient(
+            [_orch_tool_turn("verification_done", {"summary": "x"})],
+            decisions, [action],
+        )
+
+        logs: list[tuple[str, str]] = []
+        original_log = controller.log
+        controller.log = lambda tag, msg: logs.append((tag, msg))
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                fw = FindingWriter(td)
+                _run(controller.run_verification_phase(
+                    _FakeManaged(client), None, decisions, pool, fw,
+                    worker_runs={}, workers=[],
+                    iteration=1, max_iter=10, total_cost=0.0, max_cost=None, verbose=False,
+                ))
+        finally:
+            controller.log = original_log
+
+        dismiss_lines = [m for t, m in logs if "dismissed" in m and cid in m]
+        self.assertEqual(
+            len(dismiss_lines), 1,
+            f"expected one dismissal log, got: {dismiss_lines}",
+        )
+        self.assertEqual(pool.get(cid).status, "dismissed")
+
+    def test_dismiss_cannot_override_verified(self):
+        """A1 + A4: once verified, a late dismissal must not downgrade."""
+        pool = CandidatePool()
+        cid = pool.add(title="A", severity="high", endpoint="GET /x",
+                       flow_ids=["aaaa11"], summary="", evidence_notes="",
+                       reproduction_hint="")
+        decisions = DecisionQueue()
+
+        def action(d: DecisionQueue):
+            d.add_finding(FindingFiled(
+                title="A", severity="high", endpoint="GET /x",
+                description="d", reproduction_steps="r", evidence="e",
+                impact="i", verification_notes="v",
+                supersedes_candidate_ids=[cid],
+            ))
+            d.add_dismissal(cid, "races with file_finding")
+            d.set_verification_done("done")
+
+        client = _OrchSideEffectClient(
+            [_orch_tool_turn("verification_done", {"summary": "x"})],
+            decisions, [action],
+        )
+        with tempfile.TemporaryDirectory() as td:
+            fw = FindingWriter(td)
+            _run(controller.run_verification_phase(
+                _FakeManaged(client), None, decisions, pool, fw,
+                worker_runs={}, workers=[],
+                iteration=1, max_iter=10, total_cost=0.0, max_cost=None, verbose=False,
+            ))
+        self.assertEqual(pool.get(cid).status, "verified")
+
+    def test_finding_duplicate_logged_once_per_substep(self):
+        """A3: same title filed multiple times in one substep → one disk write."""
+        pool = CandidatePool()
+        cid = pool.add(title="A", severity="high", endpoint="GET /x",
+                       flow_ids=["aaaa11"], summary="", evidence_notes="",
+                       reproduction_hint="")
+        decisions = DecisionQueue()
+
+        def action(d: DecisionQueue):
+            for _ in range(3):
+                d.add_finding(FindingFiled(
+                    title="Reflected XSS", severity="high", endpoint="GET /x",
+                    description="d", reproduction_steps="r", evidence="e",
+                    impact="i", verification_notes="v",
+                    supersedes_candidate_ids=[cid],
+                ))
+            d.set_verification_done("ok")
+
+        client = _OrchSideEffectClient(
+            [_orch_tool_turn("verification_done", {"summary": "x"})],
+            decisions, [action],
+        )
+        with tempfile.TemporaryDirectory() as td:
+            fw = FindingWriter(td)
+            _run(controller.run_verification_phase(
+                _FakeManaged(client), None, decisions, pool, fw,
+                worker_runs={}, workers=[],
+                iteration=1, max_iter=10, total_cost=0.0, max_cost=None, verbose=False,
+            ))
+            self.assertEqual(fw.count, 1)
+
+
+class TestVerifyFallback(unittest.TestCase):
+    """Orphan-log emission in verify phase when auto-match misses."""
+
+    def test_orphan_logged_when_no_match(self):
+        """No strict match → candidate stays pending and orphan log fires."""
+        pool = CandidatePool()
+        cid = pool.add(title="Reflected XSS in search", severity="high",
+                       endpoint="GET /search", flow_ids=["aaaa11"],
+                       summary="", evidence_notes="", reproduction_hint="")
+        decisions = DecisionQueue()
+
+        def action(d: DecisionQueue):
+            d.add_finding(FindingFiled(
+                title="Totally unrelated auth issue", severity="high",
+                endpoint="POST /totally-different-path",
+                description="d", reproduction_steps="r", evidence="e",
+                impact="i", verification_notes="v",
+                supersedes_candidate_ids=[],
+            ))
+            # Keep the candidate pending by NOT calling verification_done —
+            # but we need to exit the loop somehow. Use dismiss_candidate
+            # on a bogus id to keep pending unchanged, then done.
+            d.set_verification_done("orphan run")
+
+        client = _OrchSideEffectClient(
+            [_orch_tool_turn("verification_done", {"summary": "x"})],
+            decisions, [action],
+        )
+        logs: list[tuple[str, str]] = []
+        original = controller.log
+        controller.log = lambda tag, msg: logs.append((tag, msg))
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                fw = FindingWriter(td)
+                _run(controller.run_verification_phase(
+                    _FakeManaged(client), None, decisions, pool, fw,
+                    worker_runs={}, workers=[],
+                    iteration=1, max_iter=10, total_cost=0.0, max_cost=None, verbose=False,
+                ))
+        finally:
+            controller.log = original
+
+        self.assertEqual(pool.get(cid).status, "pending")
+        orphan_lines = [m for _, m in logs if "finding orphan" in m]
+        self.assertEqual(len(orphan_lines), 1)
+        self.assertIn(cid, orphan_lines[0])
+
+
+class TestDirectionEfficiency(unittest.TestCase):
+    """C2, C3: no-progress early-exit and self-review gating."""
+
+    def _make_worker(self, wid: int):
+        w = controller.WorkerState(worker_id=wid, options=None)
+        w.alive = True
+        return w
+
+    def test_early_exit_on_no_progress(self):
+        """Director produces one decision on substep 1, nothing on 2 & 3
+        → loop exits before substep 4 and self-review still runs."""
+        decisions = DecisionQueue()
+        w1 = self._make_worker(1)
+        w2 = self._make_worker(2)
+
+        # Substep 1 adds one decision for a non-alive id (so coverage never
+        # completes). Substeps 2 and 3 add nothing. After two no-progress
+        # substeps, the main loop breaks. Self-review fires because
+        # decisions were produced on substep 1.
+        def action1(d: DecisionQueue):
+            d.add_decision(WorkerDecision(
+                kind="stop", worker_id=999, reason="non-alive cleanup"))
+
+        empty_turn = [
+            AssistantMessage(content=[TextBlock(text="nothing to add")], model="test"),
+            _orch_result(0.001),
+        ]
+        self_review_turn = [
+            AssistantMessage(content=[TextBlock(text="self review")], model="test"),
+            _orch_result(0.001),
+        ]
+        client = _OrchSideEffectClient(
+            [
+                _orch_tool_turn("stop_worker", {"worker_id": 999, "reason": "x"}),
+                list(empty_turn),
+                list(empty_turn),
+                list(empty_turn),                  # defensive — should not reach
+                self_review_turn,
+            ],
+            decisions,
+            [action1, None, None, None, None],
+        )
+        _run(controller.run_direction_phase(
+            _FakeManaged(client), None, decisions, [w1, w2], worker_runs={},
+            verification_summary="ok", findings_summary="x",
+            iteration=1, max_iter=10, total_cost=0.0, max_cost=None,
+            findings_count=0, stall_warnings="", follow_up_hints="", verbose=False,
+            max_workers=4, user_prompt="test",
+        ))
+        # 3 substeps in main loop (1 decision + 2 no-progress) + 1 self-review.
+        self.assertLess(
+            len(client.queries), controller.DIRECTION_MAX_SUBSTEPS + 1,
+            "should have broken out of main loop early",
+        )
+        self.assertIn("Self-review", client.queries[-1])
+
+class TestPromptBuilders(unittest.TestCase):
+    """B1, B2, B3 prompt-shape checks."""
+
+    def test_director_prompt_includes_stopped_roster(self):
+        alive = controller.WorkerState(worker_id=1, options=None)
+        alive.alive = True
+        stopped = controller.WorkerState(worker_id=2, options=None)
+        stopped.alive = False
+        msg = controller._build_director_prompt(
+            workers=[alive, stopped],
+            worker_runs={1: []},
+            verification_summary="ok",
+            findings_summary="x",
+            iteration=3, max_iter=10,
+            total_cost=0.0, max_cost=None,
+            findings_count=0, stall_warnings="", follow_up_hints="",
+            max_workers=4, user_prompt="test",
+        )
+        self.assertIn("Stopped this run: [2]", msg)
+        self.assertIn("do not re-plan around these", msg)
+
+    def test_director_prompt_omits_stopped_line_when_none(self):
+        alive = controller.WorkerState(worker_id=1, options=None)
+        alive.alive = True
+        msg = controller._build_director_prompt(
+            workers=[alive],
+            worker_runs={1: []},
+            verification_summary="ok",
+            findings_summary="x",
+            iteration=3, max_iter=10,
+            total_cost=0.0, max_cost=None,
+            findings_count=0, stall_warnings="", follow_up_hints="",
+            max_workers=4, user_prompt="test",
+        )
+        self.assertNotIn("Stopped this run", msg)
+
+    def test_worker_continue_with_findings_summary(self):
+        prompt = controller._build_worker_continue_prompt(
+            findings_summary="Findings filed so far — do not re-file:\n- XSS — /s",
+        )
+        self.assertIn("Findings filed so far — do not re-file:", prompt)
+        self.assertIn("XSS — /s", prompt)
+        self.assertIn(controller._BARE_WORKER_CONTINUE, prompt)
+
+    def test_worker_continue_without_findings_returns_bare(self):
+        prompt = controller._build_worker_continue_prompt(findings_summary="")
+        self.assertEqual(prompt, controller._BARE_WORKER_CONTINUE)
+
+    def test_verifier_continue_lists_phase_progress(self):
+        pool = CandidatePool()
+        pool.add(title="T", severity="low", endpoint="/x",
+                 flow_ids=["aaaa11"], summary="", evidence_notes="",
+                 reproduction_hint="")
+        filed = [FindingFiled(
+            title="Admin PUT JSON Injection", severity="high", endpoint="PUT /admin",
+            description="d", reproduction_steps="r", evidence="e", impact="i",
+            verification_notes="v",
+        )]
+        dismissed = [controller.CandidateDismissal(candidate_id="c004", reason="fp")]
+        msg = controller._build_verifier_continue_prompt(
+            pending=pool.pending(),
+            filed_this_phase=filed,
+            dismissed_this_phase=dismissed,
+            substep=2, max_substeps=6,
+        )
+        self.assertIn("substep 2/6", msg)
+        self.assertIn("Already filed this phase", msg)
+        self.assertIn("Admin PUT JSON Injection", msg)
+        self.assertIn("Already dismissed this phase", msg)
+        self.assertIn("c004", msg)
+
+    def test_verifier_continue_omits_sections_when_empty(self):
+        pool = CandidatePool()
+        msg = controller._build_verifier_continue_prompt(
+            pending=pool.pending(),
+            filed_this_phase=[],
+            dismissed_this_phase=[],
+            substep=2, max_substeps=6,
+        )
+        self.assertNotIn("Already filed this phase", msg)
+        self.assertNotIn("Already dismissed this phase", msg)
+
+
+class TestCoalesceInApplyLoop(unittest.TestCase):
+    """A2 hookup: when two decisions for the same worker land, apply once."""
+
+    def test_last_writer_wins_single_apply(self):
+        from tools import coalesce_decisions as _coalesce
+        d1 = WorkerDecision(kind="continue", worker_id=5,
+                            instruction="first", progress="new")
+        d2 = WorkerDecision(kind="continue", worker_id=5,
+                            instruction="second", progress="new")
+        out = _coalesce([d1, d2], None)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].instruction, "second")
 
 
 if __name__ == "__main__":

@@ -13,7 +13,9 @@ from tools import (
     PHASE_VERIFICATION,
     PlanEntry,
     WorkerDecision,
+    _parse_plan_args,
     _reject_wrong_phase,
+    coalesce_decisions,
     extract_flow_ids,
     reset_active_worker,
     set_active_worker,
@@ -272,6 +274,187 @@ class TestExtractFlowIds(unittest.TestCase):
         self.assertEqual(extract_flow_ids("data flow analysis found an issue"), [])
         self.assertEqual(extract_flow_ids("the flow chart shows"), [])
         self.assertEqual(extract_flow_ids("request flow through the system"), [])
+
+
+class TestCandidatePoolMark(unittest.TestCase):
+    """A4: mark must enforce legal transitions and be sticky on terminal states."""
+
+    def _pool_with(self, *titles: str) -> tuple[CandidatePool, list[str]]:
+        p = CandidatePool()
+        ids = [
+            p.add(title=t, severity="low", endpoint="/x",
+                  flow_ids=["aaaa11"], summary="", evidence_notes="",
+                  reproduction_hint="")
+            for t in titles
+        ]
+        return p, ids
+
+    def test_pending_to_verified_transitions(self):
+        p, [c1] = self._pool_with("a")
+        self.assertTrue(p.mark(c1, "verified"))
+        self.assertEqual(p.get(c1).status, "verified")
+
+    def test_pending_to_dismissed_transitions(self):
+        p, [c1] = self._pool_with("a")
+        self.assertTrue(p.mark(c1, "dismissed"))
+        self.assertEqual(p.get(c1).status, "dismissed")
+
+    def test_verified_cannot_become_dismissed(self):
+        p, [c1] = self._pool_with("a")
+        p.mark(c1, "verified")
+        self.assertFalse(p.mark(c1, "dismissed"))
+        self.assertEqual(p.get(c1).status, "verified")
+
+    def test_dismissed_cannot_become_verified(self):
+        p, [c1] = self._pool_with("a")
+        p.mark(c1, "dismissed")
+        self.assertFalse(p.mark(c1, "verified"))
+        self.assertEqual(p.get(c1).status, "dismissed")
+
+    def test_unknown_status_rejected(self):
+        p, [c1] = self._pool_with("a")
+        self.assertFalse(p.mark(c1, "bogus"))
+        self.assertEqual(p.get(c1).status, "pending")
+
+    def test_unknown_id_is_noop(self):
+        p, _ = self._pool_with("a")
+        self.assertFalse(p.mark("c999", "verified"))
+
+    def test_repeated_mark_same_terminal_is_noop(self):
+        p, [c1] = self._pool_with("a")
+        self.assertTrue(p.mark(c1, "verified"))
+        # A second verified call finds the candidate non-pending → no-op.
+        self.assertFalse(p.mark(c1, "verified"))
+
+
+class TestCoalesceDecisions(unittest.TestCase):
+    """A2: collapse duplicate director decisions into one per worker."""
+
+    def _dec(self, kind: str, wid: int, instruction: str = "go") -> WorkerDecision:
+        return WorkerDecision(
+            kind=kind, worker_id=wid, instruction=instruction, progress="new",
+            reason="" if kind != "stop" else "r",
+        )
+
+    def test_empty(self):
+        self.assertEqual(coalesce_decisions([], None), [])
+
+    def test_single_passes_through(self):
+        d = self._dec("continue", 1)
+        self.assertEqual(coalesce_decisions([d], None), [d])
+
+    def test_two_continues_for_one_worker_keeps_last(self):
+        d1 = self._dec("continue", 1, "first")
+        d2 = self._dec("continue", 1, "second")
+        out = coalesce_decisions([d1, d2], None)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].instruction, "second")
+
+    def test_stop_then_continue_last_wins(self):
+        stop = self._dec("stop", 1)
+        cont = self._dec("continue", 1, "after-stop")
+        out = coalesce_decisions([stop, cont], None)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].kind, "continue")
+
+    def test_continue_then_stop_last_wins(self):
+        cont = self._dec("continue", 1, "first")
+        stop = self._dec("stop", 1)
+        out = coalesce_decisions([cont, stop], None)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].kind, "stop")
+
+    def test_mixed_workers_preserved(self):
+        d1 = self._dec("continue", 1, "a")
+        d2 = self._dec("expand", 2, "b")
+        d3 = self._dec("stop", 3)
+        out = coalesce_decisions([d1, d2, d3], None)
+        self.assertEqual([d.worker_id for d in out], [1, 2, 3])
+
+    def test_plan_entry_drops_continue_and_expand(self):
+        cont = self._dec("continue", 2, "keep going")
+        expand = self._dec("expand", 3, "pivot")
+        out = coalesce_decisions(
+            [cont, expand],
+            [PlanEntry(2, "new assignment"), PlanEntry(3, "other")],
+        )
+        # Both dropped — plan covers them via the spawn/retarget path.
+        self.assertEqual(out, [])
+
+    def test_plan_entry_does_not_drop_stop(self):
+        stop = self._dec("stop", 2)
+        out = coalesce_decisions([stop], [PlanEntry(2, "retarget")])
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0].kind, "stop")
+
+    def test_ordering_stable_by_first_seen(self):
+        d2 = self._dec("continue", 2, "x")
+        d1 = self._dec("continue", 1, "y")
+        d1b = self._dec("continue", 1, "z")  # updates last for worker 1
+        out = coalesce_decisions([d2, d1, d1b], None)
+        # Order follows first-seen: worker 2 first, then worker 1.
+        self.assertEqual([d.worker_id for d in out], [2, 1])
+
+
+class TestPlanWorkersHandler(unittest.TestCase):
+    """C1: plan_workers must return per-field detail on rejection.
+
+    Tests exercise `_parse_plan_args` directly; the async handler just
+    wraps it with phase-gating and response formatting.
+    """
+
+    def test_missing_plans_key_returns_detail(self):
+        entries, rej, err = _parse_plan_args({})
+        self.assertIsNone(entries)
+        self.assertIn("cannot parse arguments", err)
+        self.assertIn("plans", err)
+
+    def test_non_list_plans_returns_detail(self):
+        entries, rej, err = _parse_plan_args({"plans": "nope"})
+        self.assertIsNone(entries)
+        self.assertIn("cannot parse arguments", err)
+
+    def test_empty_plans_returns_detail(self):
+        entries, rej, err = _parse_plan_args({"plans": []})
+        self.assertIsNone(entries)
+        self.assertIn("'plans' array is empty", err)
+
+    def test_all_invalid_returns_per_entry_reasons(self):
+        entries, rej, err = _parse_plan_args({"plans": [
+            {"worker_id": 0, "assignment": "x"},          # wid < 1
+            {"worker_id": 2, "assignment": ""},           # empty assignment
+            {"worker_id": "abc", "assignment": "y"},      # bad wid type
+            {"assignment": "z"},                          # missing wid
+            {"worker_id": 5},                             # missing assignment
+        ]})
+        self.assertIsNone(entries)
+        self.assertIn("no valid plan entries", err)
+        self.assertIn("worker_id must be >= 1", err)
+        self.assertIn("assignment is empty", err)
+        self.assertIn("worker_id must be an integer", err)
+        self.assertIn("worker_id is required", err)
+        self.assertIn("assignment is required", err)
+
+    def test_partial_success_surfaces_skipped(self):
+        entries, rej, err = _parse_plan_args({"plans": [
+            {"worker_id": 2, "assignment": "scan /api"},   # valid
+            {"worker_id": 0, "assignment": "bad"},         # skipped
+        ]})
+        self.assertIsNone(err)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].worker_id, 2)
+        self.assertEqual(entries[0].assignment, "scan /api")
+        self.assertEqual(len(rej), 1)
+        self.assertIn("worker_id must be >= 1", rej[0])
+
+    def test_all_valid_no_rejections(self):
+        entries, rej, err = _parse_plan_args({"plans": [
+            {"worker_id": 1, "assignment": "a"},
+            {"worker_id": 2, "assignment": "b"},
+        ]})
+        self.assertIsNone(err)
+        self.assertEqual([e.worker_id for e in entries], [1, 2])
+        self.assertEqual(rej, [])
 
 
 if __name__ == "__main__":

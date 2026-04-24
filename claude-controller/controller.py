@@ -57,6 +57,7 @@ from tools import (
     WorkerTurnSummary,
     build_orch_mcp_server,
     build_worker_mcp_server,
+    coalesce_decisions,
     extract_flow_ids,
     reset_active_worker,
     set_active_worker,
@@ -568,7 +569,11 @@ async def run_worker_until_escalation(
     for attempt in range(budget):
         if attempt > 0:
             try:
-                await worker.client.query("Continue your current testing plan.")
+                # Intra-iteration between-turn requery: tokens precious,
+                # skip the findings roster.
+                await worker.client.query(
+                    _build_worker_continue_prompt(findings_summary=""),
+                )
             except (ConnectionError, OSError) as exc:
                 log(f"worker {worker.worker_id}", f"Continue query failed: {exc}")
                 worker.escalation_reason = "error"
@@ -778,19 +783,36 @@ def _build_verifier_prompt(
 def _build_verifier_continue_prompt(
     *,
     pending: list[FindingCandidate],
-    filed_this_iter: int,
-    dismissed_this_iter: int,
+    filed_this_phase: list[FindingFiled],
+    dismissed_this_phase: list[CandidateDismissal],
     substep: int,
     max_substeps: int,
 ) -> str:
-    return "\n".join([
+    """Continue-prompt for the verifier between substeps.
+
+    Lists actual titles filed and candidate ids dismissed this phase so the
+    model stops re-announcing the same dispositions each substep.
+    """
+    parts = [
         (
             f"**Verification substep {substep}/{max_substeps}.** "
-            f"Filed {filed_this_iter}, dismissed {dismissed_this_iter} so far."
+            f"Filed {len(filed_this_phase)}, "
+            f"dismissed {len(dismissed_this_phase)} so far."
         ),
-        "",
-        _format_pending_candidates_list(pending),
-    ])
+    ]
+    if filed_this_phase:
+        parts.append("")
+        parts.append("Already filed this phase (do not re-file):")
+        for f in filed_this_phase:
+            parts.append(f"- {f.title}")
+    if dismissed_this_phase:
+        parts.append("")
+        parts.append("Already dismissed this phase:")
+        for d in dismissed_this_phase:
+            parts.append(f"- {d.candidate_id}")
+    parts.append("")
+    parts.append(_format_pending_candidates_list(pending))
+    return "\n".join(parts)
 
 
 def _format_follow_up_hints(
@@ -865,6 +887,12 @@ def _build_director_prompt(
     parts.append(
         f"**Alive:** [{alive_str}]  **Parallelism:** {alive_count}/{max_workers}."
     )
+    stopped_ids = [str(w.worker_id) for w in workers if not w.alive]
+    if stopped_ids:
+        parts.append(
+            f"Stopped this run: [{', '.join(stopped_ids)}] "
+            "(do not re-plan around these; pick fresh worker_ids for new workers)."
+        )
 
     # Iteration 1 is the attack-surface dispatch moment. Fan-out is the
     # default; a single worker is only correct for manifestly narrow
@@ -903,6 +931,24 @@ def _build_director_self_review_prompt() -> str:
         "**Self-review.** Any alive worker uncovered or misassigned? "
         "Make final adjustments, then `direction_done(summary)`."
     )
+
+
+_BARE_WORKER_CONTINUE = (
+    "Continue your current testing plan. Take the next concrete step."
+)
+
+
+def _build_worker_continue_prompt(findings_summary: str) -> str:
+    """Build a continue directive, prepending the findings-filed roster.
+
+    Used at iteration boundaries (implicit-continue after direction) so the
+    worker knows what's already been filed and doesn't re-report it. Intra-
+    iteration turns pass an empty `findings_summary` to keep tokens cheap.
+    """
+    summary = (findings_summary or "").strip()
+    if not summary:
+        return _BARE_WORKER_CONTINUE
+    return f"{summary}\n\n{_BARE_WORKER_CONTINUE}"
 
 
 # ---------------------------------------------------------------------------
@@ -1030,8 +1076,8 @@ async def run_verification_phase(
         else:
             user_content = _build_verifier_continue_prompt(
                 pending=pending,
-                filed_this_iter=applied_findings,
-                dismissed_this_iter=applied_dismissals,
+                filed_this_phase=decisions.findings[:applied_findings],
+                dismissed_this_phase=decisions.dismissals[:applied_dismissals],
                 substep=substep,
                 max_substeps=VERIFICATION_MAX_SUBSTEPS,
             )
@@ -1048,8 +1094,17 @@ async def run_verification_phase(
         if cost is not None:
             phase_cost += cost
 
-        # Apply new findings this substep produced
+        # Apply new findings this substep produced. `seen_titles` dedups
+        # burst `file_finding` calls within one response — `is_duplicate`
+        # still catches cross-substep dupes on disk.
+        seen_titles: set[str] = set()
         for filed in decisions.findings[applied_findings:]:
+            title_key = filed.title.strip().lower()
+            if title_key and title_key in seen_titles:
+                log("finding", f"Duplicate (same substep) skipped: {filed.title}")
+                continue
+            if title_key:
+                seen_titles.add(title_key)
             if finding_writer.is_duplicate(filed):
                 log("finding", f"Duplicate skipped: {filed.title}")
             else:
@@ -1057,17 +1112,37 @@ async def run_verification_phase(
                 log("finding", f"Written: {path}")
             resolved = list(filed.supersedes_candidate_ids)
             if not resolved:
-                auto = match_pending_candidates(filed, candidates.pending())
+                pending_now = candidates.pending()
+                auto = match_pending_candidates(filed, pending_now)
                 for cid in auto:
-                    log("finding", f"Auto-resolved candidate {cid} (matched endpoint+title)")
+                    log("finding",
+                        f"Auto-resolved candidate {cid} (matched endpoint+title)")
+                if not auto and pending_now:
+                    log("finding",
+                        "finding orphan — no pending candidate matched "
+                        f"title={_short(filed.title, 80)!r} "
+                        f"endpoint={filed.endpoint!r} "
+                        f"pending={[c.candidate_id for c in pending_now]}")
                 resolved = auto
             for cid in resolved:
                 candidates.mark(cid, "verified")
         applied_findings = len(decisions.findings)
 
         for dm in decisions.dismissals[applied_dismissals:]:
-            candidates.mark(dm.candidate_id, "dismissed")
-            log("finding", f"Candidate {dm.candidate_id} dismissed: {_short(dm.reason, 80)}")
+            existing = candidates.get(dm.candidate_id)
+            if existing is None:
+                log("finding",
+                    f"Candidate {dm.candidate_id} dismissal ignored "
+                    "(unknown candidate_id).")
+                continue
+            if existing.status != "pending":
+                # Skip the log-each-time loop when the verifier repeatedly
+                # dismisses the same candidate in one substep burst.
+                continue
+            if candidates.mark(dm.candidate_id, "dismissed"):
+                log("finding",
+                    f"Candidate {dm.candidate_id} dismissed: "
+                    f"{_short(dm.reason, 80)}")
         applied_dismissals = len(decisions.dismissals)
 
         if decisions.verification_done_summary is not None:
@@ -1111,6 +1186,13 @@ async def run_direction_phase(
     phase_cost = 0.0
     alive_ids = {w.worker_id for w in workers if w.alive}
     aborted = False
+
+    def _decision_total() -> int:
+        plan_len = len(decisions.plan) if decisions.plan is not None else 0
+        return len(decisions.worker_decisions) + plan_len
+
+    prev_total = _decision_total()
+    no_progress_streak = 0
 
     for substep in range(1, DIRECTION_MAX_SUBSTEPS + 1):
         covered = {d.worker_id for d in decisions.worker_decisions}
@@ -1163,6 +1245,18 @@ async def run_direction_phase(
         if decisions.plan is not None:
             covered |= {p.worker_id for p in decisions.plan}
         if not (alive_ids - covered):
+            break
+
+        # C2: early-exit when the director stops producing new decisions.
+        total_now = _decision_total()
+        if total_now == prev_total:
+            no_progress_streak += 1
+        else:
+            no_progress_streak = 0
+        prev_total = total_now
+        if no_progress_streak >= 2:
+            log("direct",
+                f"direct early-exit no progress after substep {substep}.")
             break
 
     # Mandatory self-review substep unless the director already ended the run
@@ -1500,8 +1594,21 @@ async def run(config: Config) -> None:
                     )
 
                 # 9) Per-worker decisions
+                #
+                # Coalesce duplicate decisions the director may have issued
+                # across substeps (continue_worker + expand_worker for the
+                # same worker; stop after continue; etc). The apply loop
+                # below then sees at most one decision per worker.
+                original_decisions = list(decisions.worker_decisions)
+                effective_decisions = coalesce_decisions(
+                    original_decisions, decisions.plan,
+                )
+                if len(effective_decisions) != len(original_decisions):
+                    log(f"iter {iteration}",
+                        f"decision coalesced original={len(original_decisions)} "
+                        f"effective={len(effective_decisions)}")
                 decided_wids: set[int] = set()
-                for d in decisions.worker_decisions:
+                for d in effective_decisions:
                     worker = next((w for w in workers if w.worker_id == d.worker_id), None)
                     if worker is None or not worker.alive:
                         log(f"iter {iteration}",
@@ -1511,6 +1618,7 @@ async def run(config: Config) -> None:
                     decided_wids.add(d.worker_id)
 
                 # 10) Implicit continue for undirected alive workers
+                worker_findings_summary = finding_writer.summary_for_worker()
                 for w in workers:
                     if not w.alive or w.worker_id in decided_wids:
                         continue
@@ -1520,7 +1628,9 @@ async def run(config: Config) -> None:
                         f"Worker {w.worker_id}: no explicit decision — implicit continue "
                         f"(budget={w.autonomous_budget}).")
                     try:
-                        await w.client.query("Continue your current testing plan.")
+                        await w.client.query(_build_worker_continue_prompt(
+                            findings_summary=worker_findings_summary,
+                        ))
                     except (ConnectionError, OSError):
                         await attempt_worker_recovery(w)
 
